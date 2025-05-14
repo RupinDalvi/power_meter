@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Cycling Power Estimator (1-sec IMU)</title>
+    <title>Cycling Power Estimator (2-sec IMU, RK2)</title>
     <style>
         body { font-family: sans-serif; margin: 10px; background-color: #f0f0f0; color: #333; line-height: 1.6; }
         .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
@@ -24,7 +24,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>Cycling Power Estimator (1-sec IMU)</h1>
+        <h1>Cycling Power Estimator (2-sec IMU, RK2)</h1>
         <div id="permissionStatus">Requesting permissions...</div>
 
         <h2>Configuration</h2>
@@ -46,7 +46,8 @@
         </div>
         <div class="input-group">
             <label for="airDensity">Air Density (kg/m³):</label>
-            <input type="number" id="airDensity" step="0.01" value="1.1"> </div>
+            <input type="number" id="airDensity" step="0.01" value="1.1">
+        </div>
         <div class="input-group">
             <label for="accelFilterAlpha">Accel. Filter Alpha (0-1, smaller=smoother):</label>
             <input type="number" id="accelFilterAlpha" step="0.01" min="0.01" max="0.99" value="0.2">
@@ -55,15 +56,15 @@
         <button id="startTrackingButton">Start Tracking & Estimating Power</button>
 
         <hr>
-        <h2>Live Data (per 1-second window)</h2>
+        <h2>Live Data (per 2-second window)</h2>
         <p><strong>Status:</strong> <span id="status">Idle</span></p>
         <p class="power-output"><strong>Estimated Power:</strong> <span id="powerOutput">0</span> W</p>
         <p class="coordinates">Displacement X: <span id="imuDispX">0.00</span>m, Y: <span id="imuDispY">0.00</span>m, Z: <span id="imuDispZ">0.00</span>m</p>
         <p class="coordinates">Final Velocity X: <span id="imuVelX">0.00</span>m/s, Y: <span id="imuVelY">0.00</span>m/s, Z: <span id="imuVelZ">0.00</span>m/s</p>
+        <p>Window Duration: <span id="windowDuration">0.00</span>s</p>
     </div>
 
     <script>
-        // --- UI Elements ---
         const statusEl = document.getElementById('status');
         const powerOutputEl = document.getElementById('powerOutput');
         const imuDispXEl = document.getElementById('imuDispX');
@@ -72,9 +73,10 @@
         const imuVelXEl = document.getElementById('imuVelX');
         const imuVelYEl = document.getElementById('imuVelY');
         const imuVelZEl = document.getElementById('imuVelZ');
+        const windowDurationEl = document.getElementById('windowDuration');
         const startTrackingButton = document.getElementById('startTrackingButton');
         const permissionStatusEl = document.getElementById('permissionStatus');
-        // User Parameter Inputs
+
         const totalMassInput = document.getElementById('totalMass');
         const dragCoefficientInput = document.getElementById('dragCoefficient');
         const frontalAreaInput = document.getElementById('frontalArea');
@@ -82,27 +84,23 @@
         const airDensityInput = document.getElementById('airDensity');
         const accelFilterAlphaInput = document.getElementById('accelFilterAlpha');
 
-        // --- State Variables ---
         let linearAccelerationSensor = null;
         let absoluteOrientationSensor = null;
 
         let imuRawAcceleration = { x: 0, y: 0, z: 0 };
         let imuOrientationQuaternion = [0, 0, 0, 1];
-        // let imuWorldAcceleration = { x: 0, y: 0, z: 0 }; // Raw world accel
-        let filteredWorldAcceleration = { x: 0, y: 0, z: 0 }; // Filtered world accel
+        let filteredWorldAcceleration = { x: 0, y: 0, z: 0 };
         let imuVelocity = { x: 0, y: 0, z: 0 };
         let imuPositionOffset = { x: 0, y: 0, z: 0 };
 
-        let lastTimestamp_IMU_Processing = null; // For high-frequency IMU data processing
+        let lastTimestamp_IMU_Processing = null;
         let isTracking = false;
-        const GRAVITY_ACCEL = 9.80665; // m/s^2
-        let ACCEL_FILTER_ALPHA = 0.2; // Default, will be updated from input
+        const GRAVITY_ACCEL = 9.80665;
+        let ACCEL_FILTER_ALPHA = 0.2;
 
-        // Power Calculation State
-        let oneSecondIntervalTimer = null;
-        let lastOneSecondTimestamp = 0; // For measuring actual 1-second interval duration
+        let twoSecondIntervalTimer = null;
+        let lastTwoSecondTimestamp = 0;
         let userPowerParams = {};
-
 
         function rotateVectorByQuaternion(vec, quat) {
             const [qx, qy, qz, qw] = quat;
@@ -116,94 +114,85 @@
             return { x: rotatedX, y: rotatedY, z: rotatedZ };
         }
 
-        function processIMUData() { // Called at sensor frequency (e.g., 60Hz)
-            if (!isTracking || !lastTimestamp_IMU_Processing) { // Ensure lastTimestamp is set
-                lastTimestamp_IMU_Processing = performance.now(); // Initialize if not set
-                return;
+        function processIMUData() {
+            if (!isTracking || lastTimestamp_IMU_Processing === null) {
+                return; // lastTimestamp_IMU_Processing will be set when tracking starts
             }
 
             const now = performance.now();
             const deltaTimeIMU = (now - lastTimestamp_IMU_Processing) / 1000.0;
             lastTimestamp_IMU_Processing = now;
 
-            if (deltaTimeIMU <= 0) return; // Avoid issues if timestamps are weird
+            if (deltaTimeIMU <= 0 || deltaTimeIMU > 0.5) { // Guard against large gaps or invalid timestamps
+                 console.warn(`Anomalous deltaTimeIMU: ${deltaTimeIMU}s. Skipping this IMU update.`);
+                 return;
+            }
+
 
             const currentWorldAccelSample = rotateVectorByQuaternion(imuRawAcceleration, imuOrientationQuaternion);
 
-            // Apply Low-Pass Filter to World Acceleration
             filteredWorldAcceleration.x = ACCEL_FILTER_ALPHA * currentWorldAccelSample.x + (1 - ACCEL_FILTER_ALPHA) * filteredWorldAcceleration.x;
             filteredWorldAcceleration.y = ACCEL_FILTER_ALPHA * currentWorldAccelSample.y + (1 - ACCEL_FILTER_ALPHA) * filteredWorldAcceleration.y;
             filteredWorldAcceleration.z = ACCEL_FILTER_ALPHA * currentWorldAccelSample.z + (1 - ACCEL_FILTER_ALPHA) * filteredWorldAcceleration.z;
 
-            // Integrate filtered acceleration to get velocity
+            // Store velocity from start of this small IMU step (v0)
+            const v0x = imuVelocity.x;
+            const v0y = imuVelocity.y;
+            const v0z = imuVelocity.z;
+
+            // Update velocity using Euler (v1 = v0 + a*dt)
             imuVelocity.x += filteredWorldAcceleration.x * deltaTimeIMU;
             imuVelocity.y += filteredWorldAcceleration.y * deltaTimeIMU;
             imuVelocity.z += filteredWorldAcceleration.z * deltaTimeIMU;
 
-            // Integrate velocity to get position offset
-            imuPositionOffset.x += imuVelocity.x * deltaTimeIMU;
-            imuPositionOffset.y += imuVelocity.y * deltaTimeIMU;
-            imuPositionOffset.z += imuVelocity.z * deltaTimeIMU;
-
-            // UI update for instantaneous displacement/velocity is now done in the 1-sec timer
-            // to show the final values for the completed window before reset.
+            // Update position using Trapezoidal rule (p1 = p0 + (v0+v1)/2 * dt)
+            imuPositionOffset.x += (v0x + imuVelocity.x) / 2 * deltaTimeIMU;
+            imuPositionOffset.y += (v0y + imuVelocity.y) / 2 * deltaTimeIMU;
+            imuPositionOffset.z += (v0z + imuVelocity.z) / 2 * deltaTimeIMU;
         }
-
 
         function calculateCyclingPower(params) {
             const {
-                displacement, // This is the total offset achieved in the 1s window
-                finalVelocity,  // This is the final velocity at the end of the 1s window
-                deltaTimeWindow, // Duration of the window (should be ~1s)
-                userConfig
+                displacement, finalVelocity,
+                deltaTimeWindow, userConfig
             } = params;
 
-            if (deltaTimeWindow <= 0) return 0;
+            if (deltaTimeWindow <= 0.1) { // If interval is too short, likely no meaningful work
+                console.warn(`deltaTimeWindow too short for power calc: ${deltaTimeWindow}`);
+                return 0;
+            }
 
             const dx = displacement.x;
             const dy = displacement.y;
             const dz = displacement.z;
 
             const distanceHorizontal = Math.sqrt(dx * dx + dy * dy);
-            // Velocity at the END of the 1-second interval
             const finalVelocityHorizontal = Math.sqrt(finalVelocity.x * finalVelocity.x + finalVelocity.y * finalVelocity.y);
-            // Velocity at the START of the 1-second interval is 0 (due to reset)
-            const initialVelocityHorizontal = 0;
+            const initialVelocityHorizontal = 0; // Reset at start of each window
 
-            // 1. Work against gravity
             const workGravity = userConfig.totalMass * GRAVITY_ACCEL * dz;
-
-            // 2. Work against aerodynamic drag
-            // Use average horizontal velocity for the interval for drag force
             const avgVelocityHorizontalForDrag = (finalVelocityHorizontal + initialVelocityHorizontal) / 2;
             const forceDrag = 0.5 * userConfig.airDensity * avgVelocityHorizontalForDrag * avgVelocityHorizontalForDrag * userConfig.dragCoefficient * userConfig.frontalArea;
             const workDrag = forceDrag * distanceHorizontal;
-
-            // 3. Work against rolling resistance
-            const forceRolling = userConfig.rollingResistanceCoefficient * userConfig.totalMass * GRAVITY_ACCEL; // Assuming cos(slope_angle) ~ 1
+            const forceRolling = userConfig.rollingResistanceCoefficient * userConfig.totalMass * GRAVITY_ACCEL;
             const workRolling = forceRolling * distanceHorizontal;
-
-            // 4. Work for Kinetic Energy Change
-            // Initial total velocity is 0 for the window. Final total velocity:
             const finalVelocityMagnitude = Math.sqrt(finalVelocity.x**2 + finalVelocity.y**2 + finalVelocity.z**2);
-            const workKinetic = 0.5 * userConfig.totalMass * (finalVelocityMagnitude * finalVelocityMagnitude - 0);
-
+            const workKinetic = 0.5 * userConfig.totalMass * (finalVelocityMagnitude * finalVelocityMagnitude - 0); // Initial kinetic energy for window is 0
 
             const totalWork = workGravity + workDrag + workRolling + workKinetic;
             let power = totalWork / deltaTimeWindow;
-
             return power > 0 ? power : 0;
         }
 
-        function updateUIDisplayCycleEnd(displacement, finalVelocity) {
+        function updateUIDisplayCycleEnd(displacement, finalVelocity, duration) {
             imuDispXEl.textContent = displacement.x.toFixed(2);
             imuDispYEl.textContent = displacement.y.toFixed(2);
             imuDispZEl.textContent = displacement.z.toFixed(2);
             imuVelXEl.textContent = finalVelocity.x.toFixed(2);
             imuVelYEl.textContent = finalVelocity.y.toFixed(2);
             imuVelZEl.textContent = finalVelocity.z.toFixed(2);
+            windowDurationEl.textContent = duration.toFixed(2);
         }
-
 
         async function requestPermissionsAndInitSensors() {
             permissionStatusEl.textContent = "Requesting permissions...";
@@ -221,7 +210,6 @@
                 return new Promise((resolve, reject) => {
                     let sensorsOk = { accel: false, orient: false };
                     const checkAllOk = () => { if (sensorsOk.accel && sensorsOk.orient) resolve(true); };
-
                     const onSensorError = (sensorName, event) => {
                          console.error(`${sensorName} Error:`, event.error);
                          statusEl.textContent = `${sensorName} Error: ${event.error.message}.`;
@@ -234,7 +222,7 @@
                             imuRawAcceleration.x = linearAccelerationSensor.x || 0;
                             imuRawAcceleration.y = linearAccelerationSensor.y || 0;
                             imuRawAcceleration.z = linearAccelerationSensor.z || 0;
-                            if (isTracking) processIMUData(); // High-frequency processing
+                            if (isTracking) processIMUData();
                         });
                         linearAccelerationSensor.addEventListener('error', e => onSensorError('LinearAccelerationSensor', e));
                         linearAccelerationSensor.start();
@@ -252,7 +240,7 @@
                         absoluteOrientationSensor.start();
                         sensorsOk.orient = true;
                     } else { reject(new Error('AbsoluteOrientationSensor not supported.')); return; }
-                    checkAllOk(); // Check if both synchronous starts are OK
+                    checkAllOk();
                 });
             } catch (error) {
                 permissionStatusEl.textContent = `Error: ${error.message}`;
@@ -272,72 +260,71 @@
                     airDensity: parseFloat(airDensityInput.value)
                 };
                 ACCEL_FILTER_ALPHA = parseFloat(accelFilterAlphaInput.value);
-
                 if (Object.values(userPowerParams).some(isNaN) || isNaN(ACCEL_FILTER_ALPHA) || ACCEL_FILTER_ALPHA <=0 || ACCEL_FILTER_ALPHA >=1) {
                     alert("Please ensure all configuration values are valid numbers and Alpha is between 0.01 and 0.99.");
                     return;
                 }
 
-                const success = await requestPermissionsAndInitSensors();
-                if (success) {
+                try {
+                    await requestPermissionsAndInitSensors(); // Wait for sensors to initialize
                     isTracking = true;
                     startTrackingButton.textContent = "Stop Tracking";
                     startTrackingButton.classList.add("stop");
                     statusEl.textContent = "Tracking...";
 
-                    // Reset states for new session
                     imuPositionOffset = { x: 0, y: 0, z: 0 };
                     imuVelocity = { x: 0, y: 0, z: 0 };
-                    filteredWorldAcceleration = { x: 0, y: 0, z: 0 }; // Reset filter state
-                    lastTimestamp_IMU_Processing = performance.now(); // Critical for first deltaTimeIMU
-                    lastOneSecondTimestamp = performance.now(); // Critical for first deltaTimeWindow
+                    filteredWorldAcceleration = { x: 0, y: 0, z: 0 };
+                    lastTimestamp_IMU_Processing = performance.now();
+                    lastTwoSecondTimestamp = performance.now();
 
-
-                    oneSecondIntervalTimer = setInterval(() => {
+                    twoSecondIntervalTimer = setInterval(() => {
                         if (!isTracking) return;
 
                         const now = performance.now();
-                        const actualIntervalDuration = (now - lastOneSecondTimestamp) / 1000.0;
-                        lastOneSecondTimestamp = now;
+                        const actualIntervalDuration = (now - lastTwoSecondTimestamp) / 1000.0;
+                        // lastTwoSecondTimestamp will be updated *after* using its old value for duration.
 
-                        // Values in imuPositionOffset and imuVelocity are the final displacement/velocity for the completed 1-sec window
-                        const displacementThisSecond = { ...imuPositionOffset };
-                        const finalVelocityThisSecond = { ...imuVelocity };
+                        const displacementThisWindow = { ...imuPositionOffset };
+                        const finalVelocityThisWindow = { ...imuVelocity };
 
                         const power = calculateCyclingPower({
-                            displacement: displacementThisSecond,
-                            finalVelocity: finalVelocityThisSecond,
-                            deltaTimeWindow: actualIntervalDuration > 0.05 ? actualIntervalDuration : 1.0, // Guard against tiny dt, default to 1.0
+                            displacement: displacementThisWindow,
+                            finalVelocity: finalVelocityThisWindow,
+                            deltaTimeWindow: actualIntervalDuration,
                             userConfig: userPowerParams
                         });
 
                         powerOutputEl.textContent = power.toFixed(0);
-                        updateUIDisplayCycleEnd(displacementThisSecond, finalVelocityThisSecond);
+                        updateUIDisplayCycleEnd(displacementThisWindow, finalVelocityThisWindow, actualIntervalDuration);
 
-                        // Reset for the next 1-second window
+                        // Reset for the next 2-second window
                         imuPositionOffset = { x: 0, y: 0, z: 0 };
                         imuVelocity = { x: 0, y: 0, z: 0 };
-                        // lastTimestamp_IMU_Processing is self-managed in processIMUData
-                        // filteredWorldAcceleration carries over its state, which is correct for a continuous filter
-                    }, 1000); // Target 1-second interval
+                        // filteredWorldAcceleration state is intentionally carried over.
+                        lastTwoSecondTimestamp = now; // Mark the beginning of the next interval for duration calculation.
 
-                } else {
-                     statusEl.textContent = "Failed to start sensors.";
+                    }, 2000); // Target 2-second interval
+                } catch (error) {
+                    statusEl.textContent = "Failed to start sensors: " + error.message;
+                    console.error("Sensor start failed:", error);
                 }
             } else {
                 isTracking = false;
                 if (linearAccelerationSensor) linearAccelerationSensor.stop();
                 if (absoluteOrientationSensor) absoluteOrientationSensor.stop();
-                if (oneSecondIntervalTimer) clearInterval(oneSecondIntervalTimer);
+                if (twoSecondIntervalTimer) clearInterval(twoSecondIntervalTimer);
+                twoSecondIntervalTimer = null; // Clear the reference
 
                 statusEl.textContent = "Idle - Tracking Stopped";
                 powerOutputEl.textContent = "0";
                 startTrackingButton.textContent = "Start Tracking & Estimating Power";
                 startTrackingButton.classList.remove("stop");
                 permissionStatusEl.textContent = "";
+                lastTimestamp_IMU_Processing = null; // Reset for next start
             }
         });
-        // Initial UI state
-        updateUIDisplayCycleEnd({x:0,y:0,z:0}, {x:0,y:0,z:0}); // Show zeros initially
-    </script></body>
+        updateUIDisplayCycleEnd({x:0,y:0,z:0}, {x:0,y:0,z:0}, 0);
+    </script>
+</body>
 </html>
