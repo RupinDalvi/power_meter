@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Cycling Power Estimator (Medians)</title>
+    <title>Cycling Power Estimator (Overlapping Windows)</title>
     <style>
+        /* CSS remains largely the same, ensure it's included */
         body { font-family: sans-serif; margin: 10px; background-color: #f0f0f0; color: #333; line-height: 1.6; }
         .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         h1, h2 { color: #0056b3; text-align: center; }
@@ -24,7 +25,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>Cycling Power Estimator (Medians)</h1>
+        <h1>Cycling Power Estimator (Overlapping Windows)</h1>
         <div id="permissionStatus">Requesting permissions...</div>
 
         <h2>Configuration</h2>
@@ -53,31 +54,29 @@
             <input type="number" id="accelFilterAlpha" step="0.01" min="0.01" max="0.99" value="0.2">
         </div>
 
+
         <button id="startTrackingButton">Start Tracking & Estimating Power</button>
 
         <hr>
-        <h2>Live Data (per 2-second window)</h2>
+        <h2>Live Data (2-sec Window, updates every 1-sec)</h2>
         <p><strong>Status:</strong> <span id="status">Idle</span></p>
         <p class="power-output"><strong>Estimated Power:</strong> <span id="powerOutput">0</span> W</p>
-        <p class="coordinates">Displacement X: <span id="imuDispX">0.00</span>m, Y: <span id="imuDispY">0.00</span>m, Z: <span id="imuDispZ">0.00</span>m</p>
-        <p class="coordinates">Final Velocity X: <span id="imuVelX">0.00</span>m/s, Y: <span id="imuVelY">0.00</span>m/s, Z: <span id="imuVelZ">0.00</span>m/s</p>
+        <p class="coordinates">Win. Disp. X: <span id="winDispX">0.00</span>m, Y: <span id="winDispY">0.00</span>m, Z: <span id="winDispZ">0.00</span>m</p>
+        <p class="coordinates">Win. Final Vel. (H): <span id="winFinalVelH">0.00</span>m/s</p>
         <p>Window Duration: <span id="windowDuration">0.00</span>s</p>
         <hr>
-        <h2>Medians (last 10 samples)</h2>
+        <h2>Medians (Top 5 of last 10 samples)</h2>
         <p class="median-output"><strong>Median Power:</strong> <span id="medianPowerOutput">0</span> W</p>
         <p class="median-output"><strong>Median Velocity (H):</strong> <span id="medianVelocityOutput">0.00</span> m/s</p>
-
     </div>
 
     <script>
         const statusEl = document.getElementById('status');
         const powerOutputEl = document.getElementById('powerOutput');
-        const imuDispXEl = document.getElementById('imuDispX');
-        const imuDispYEl = document.getElementById('imuDispY');
-        const imuDispZEl = document.getElementById('imuDispZ');
-        const imuVelXEl = document.getElementById('imuVelX');
-        const imuVelYEl = document.getElementById('imuVelY');
-        const imuVelZEl = document.getElementById('imuVelZ');
+        const winDispXEl = document.getElementById('winDispX');
+        const winDispYEl = document.getElementById('winDispY');
+        const winDispZEl = document.getElementById('winDispZ');
+        const winFinalVelHEl = document.getElementById('winFinalVelH');
         const windowDurationEl = document.getElementById('windowDuration');
         const medianPowerOutputEl = document.getElementById('medianPowerOutput');
         const medianVelocityOutputEl = document.getElementById('medianVelocityOutput');
@@ -94,25 +93,30 @@
         let linearAccelerationSensor = null;
         let absoluteOrientationSensor = null;
 
+        // Continuously integrated states
         let imuRawAcceleration = { x: 0, y: 0, z: 0 };
         let imuOrientationQuaternion = [0, 0, 0, 1];
         let filteredWorldAcceleration = { x: 0, y: 0, z: 0 };
-        let imuVelocity = { x: 0, y: 0, z: 0 };
-        let imuPositionOffset = { x: 0, y: 0, z: 0 };
+        let currentVelocity = { x: 0, y: 0, z: 0 }; // Renamed from imuVelocity
+        let currentPosition = { x: 0, y: 0, z: 0 }; // Renamed from imuPositionOffset
+
+        let stateHistory = []; // Stores {ts, pos: {x,y,z}, vel: {x,y,z}}
+        const STATE_HISTORY_DURATION_MS = 4000; // Keep ~4s of history for 2s windows
 
         let lastTimestamp_IMU_Processing = null;
         let isTracking = false;
         const GRAVITY_ACCEL = 9.80665;
         let ACCEL_FILTER_ALPHA = 0.2;
 
-        let twoSecondIntervalTimer = null;
-        let lastTwoSecondTimestamp = 0;
-        let userPowerParams = {};
+        let powerCalculationTimer = null; // Fires every 1 second
+        const POWER_CALC_WINDOW_MS = 2000; // Calculate power over 2 seconds of data
+        const POWER_CALC_INTERVAL_MS = 1000; // Update power every 1 second
 
-        // History for median calculation
+        let userPowerParams = {};
         let powerHistory = [];
-        let velocityHistory = []; // Will store final horizontal velocity of each window
-        const MAX_HISTORY_LENGTH = 10;
+        let velocityHistory = []; // Stores final horizontal velocity of each window
+        const MAX_MEDIAN_HISTORY_LENGTH = 10;
+
 
         function rotateVectorByQuaternion(vec, quat) {
             const [qx, qy, qz, qw] = quat;
@@ -126,16 +130,15 @@
             return { x: rotatedX, y: rotatedY, z: rotatedZ };
         }
 
-        function processIMUData() {
-            if (!isTracking || lastTimestamp_IMU_Processing === null) {
-                return;
-            }
+        function processIMUData() { // Called at sensor frequency (e.g., 60Hz)
+            if (!isTracking || lastTimestamp_IMU_Processing === null) return;
+
             const now = performance.now();
             const deltaTimeIMU = (now - lastTimestamp_IMU_Processing) / 1000.0;
             lastTimestamp_IMU_Processing = now;
 
             if (deltaTimeIMU <= 0 || deltaTimeIMU > 0.5) {
-                 console.warn(`Anomalous deltaTimeIMU: ${deltaTimeIMU}s. Skipping this IMU update.`);
+                 console.warn(`Anomalous deltaTimeIMU: ${deltaTimeIMU}s. Skipping.`);
                  return;
             }
 
@@ -144,35 +147,47 @@
             filteredWorldAcceleration.y = ACCEL_FILTER_ALPHA * currentWorldAccelSample.y + (1 - ACCEL_FILTER_ALPHA) * filteredWorldAcceleration.y;
             filteredWorldAcceleration.z = ACCEL_FILTER_ALPHA * currentWorldAccelSample.z + (1 - ACCEL_FILTER_ALPHA) * filteredWorldAcceleration.z;
 
-            const v0x = imuVelocity.x;
-            const v0y = imuVelocity.y;
-            const v0z = imuVelocity.z;
-            imuVelocity.x += filteredWorldAcceleration.x * deltaTimeIMU;
-            imuVelocity.y += filteredWorldAcceleration.y * deltaTimeIMU;
-            imuVelocity.z += filteredWorldAcceleration.z * deltaTimeIMU;
-            imuPositionOffset.x += (v0x + imuVelocity.x) / 2 * deltaTimeIMU;
-            imuPositionOffset.y += (v0y + imuVelocity.y) / 2 * deltaTimeIMU;
-            imuPositionOffset.z += (v0z + imuVelocity.z) / 2 * deltaTimeIMU;
+            const v0x = currentVelocity.x;
+            const v0y = currentVelocity.y;
+            const v0z = currentVelocity.z;
+            currentVelocity.x += filteredWorldAcceleration.x * deltaTimeIMU;
+            currentVelocity.y += filteredWorldAcceleration.y * deltaTimeIMU;
+            currentVelocity.z += filteredWorldAcceleration.z * deltaTimeIMU;
+
+            currentPosition.x += (v0x + currentVelocity.x) / 2 * deltaTimeIMU;
+            currentPosition.y += (v0y + currentVelocity.y) / 2 * deltaTimeIMU;
+            currentPosition.z += (v0z + currentVelocity.z) / 2 * deltaTimeIMU;
+
+            // Add current state to history
+            stateHistory.push({
+                ts: now,
+                pos: { ...currentPosition },
+                vel: { ...currentVelocity }
+            });
+
+            // Prune old history
+            while (stateHistory.length > 0 && stateHistory[0].ts < now - STATE_HISTORY_DURATION_MS) {
+                stateHistory.shift();
+            }
         }
 
         function calculateCyclingPower(params) {
             const {
-                displacement, finalVelocity,
+                displacement, // dx, dy, dz for the window
+                initialVelocityTotalMag, finalVelocityTotalMag,
+                initialVelocityHorizontal, finalVelocityHorizontal,
                 deltaTimeWindow, userConfig
             } = params;
 
-            if (deltaTimeWindow <= 0.1) {
-                console.warn(`deltaTimeWindow too short for power calc: ${deltaTimeWindow}`);
-                return {power: 0, finalVelocityHorizontal: 0}; // Return object
+            if (deltaTimeWindow < (POWER_CALC_WINDOW_MS / 1000.0) * 0.75) { // If window is much shorter than expected
+                console.warn(`deltaTimeWindow too short for power calc: ${deltaTimeWindow.toFixed(3)}s`);
+                return { power: 0, finalVelocityHorizontal: finalVelocityHorizontal };
             }
 
             const dx = displacement.x;
             const dy = displacement.y;
             const dz = displacement.z;
-
             const distanceHorizontal = Math.sqrt(dx * dx + dy * dy);
-            const finalVelocityHorizontal = Math.sqrt(finalVelocity.x * finalVelocity.x + finalVelocity.y * finalVelocity.y);
-            const initialVelocityHorizontal = 0;
 
             const workGravity = userConfig.totalMass * GRAVITY_ACCEL * dz;
             const avgVelocityHorizontalForDrag = (finalVelocityHorizontal + initialVelocityHorizontal) / 2;
@@ -180,15 +195,14 @@
             const workDrag = forceDrag * distanceHorizontal;
             const forceRolling = userConfig.rollingResistanceCoefficient * userConfig.totalMass * GRAVITY_ACCEL;
             const workRolling = forceRolling * distanceHorizontal;
-            const finalVelocityMagnitude = Math.sqrt(finalVelocity.x**2 + finalVelocity.y**2 + finalVelocity.z**2);
-            const workKinetic = 0.5 * userConfig.totalMass * (finalVelocityMagnitude * finalVelocityMagnitude - 0);
+            const workKinetic = 0.5 * userConfig.totalMass * (finalVelocityTotalMag * finalVelocityTotalMag - initialVelocityTotalMag * initialVelocityTotalMag);
 
             const totalWork = workGravity + workDrag + workRolling + workKinetic;
             let power = totalWork / deltaTimeWindow;
-            return {power: power > 0 ? power : 0, finalVelocityHorizontal: finalVelocityHorizontal};
+            return { power: power > 0 ? power : 0, finalVelocityHorizontal: finalVelocityHorizontal };
         }
 
-        function calculateMedian(arr) {
+        function calculateMedian(arr) { // Basic median for odd/even length
             if (!arr || arr.length === 0) return 0;
             const sortedArr = [...arr].sort((a, b) => a - b);
             const mid = Math.floor(sortedArr.length / 2);
@@ -199,23 +213,38 @@
             }
         }
 
-        function updateUIDisplayCycleEnd(displacement, finalVelocity, duration, currentPower, medianPower, medianVelocity) {
-            imuDispXEl.textContent = displacement.x.toFixed(2);
-            imuDispYEl.textContent = displacement.y.toFixed(2);
-            imuDispZEl.textContent = displacement.z.toFixed(2);
-            imuVelXEl.textContent = finalVelocity.x.toFixed(2);
-            imuVelYEl.textContent = finalVelocity.y.toFixed(2);
-            imuVelZEl.textContent = finalVelocity.z.toFixed(2);
+        function calculateMedianOfTopN(arr, totalSamplesToConsider, topN) {
+            if (!arr || arr.length === 0) return 0;
+
+            // Ensure we only consider the last 'totalSamplesToConsider' from the history
+            const consideredSamples = arr.length > totalSamplesToConsider ? arr.slice(-totalSamplesToConsider) : [...arr];
+
+            if (consideredSamples.length < topN) { // Not enough samples to pick topN
+                return calculateMedian(consideredSamples); // Median of what we have
+            }
+
+            const sortedArrDesc = [...consideredSamples].sort((a, b) => b - a); // Sort descending
+            const topNValues = sortedArrDesc.slice(0, topN); // Take the first N elements
+
+            return calculateMedian(topNValues); // Median of these top N values
+        }
+
+
+        function updateUIDisplay(powerData, medianData, windowDisp, windowFinalVelH, duration) {
+            powerOutputEl.textContent = powerData.power.toFixed(0);
+            winDispXEl.textContent = windowDisp.x.toFixed(2);
+            winDispYEl.textContent = windowDisp.y.toFixed(2);
+            winDispZEl.textContent = windowDisp.z.toFixed(2);
+            winFinalVelHEl.textContent = windowFinalVelH.toFixed(2);
             windowDurationEl.textContent = duration.toFixed(2);
-            powerOutputEl.textContent = currentPower.toFixed(0);
-            medianPowerOutputEl.textContent = medianPower.toFixed(0);
-            medianVelocityOutputEl.textContent = medianVelocity.toFixed(2);
+            medianPowerOutputEl.textContent = medianData.power.toFixed(0);
+            medianVelocityOutputEl.textContent = medianData.velocity.toFixed(2);
         }
 
         async function requestPermissionsAndInitSensors() {
+            // ... (same as before)
             permissionStatusEl.textContent = "Requesting permissions...";
             try {
-                // Permissions (same as before)
                 if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
                     const motionPerm = await DeviceMotionEvent.requestPermission();
                     if (motionPerm !== 'granted') throw new Error('Motion sensor permission denied.');
@@ -291,70 +320,109 @@
                     startTrackingButton.classList.add("stop");
                     statusEl.textContent = "Tracking...";
 
-                    imuPositionOffset = { x: 0, y: 0, z: 0 };
-                    imuVelocity = { x: 0, y: 0, z: 0 };
+                    // Reset states for new session
+                    currentPosition = { x: 0, y: 0, z: 0 };
+                    currentVelocity = { x: 0, y: 0, z: 0 };
                     filteredWorldAcceleration = { x: 0, y: 0, z: 0 };
-                    powerHistory = []; // Reset history
-                    velocityHistory = []; // Reset history
+                    stateHistory = [];
+                    powerHistory = [];
+                    velocityHistory = [];
                     lastTimestamp_IMU_Processing = performance.now();
-                    lastTwoSecondTimestamp = performance.now();
 
-                    twoSecondIntervalTimer = setInterval(() => {
-                        if (!isTracking) return;
 
-                        const now = performance.now();
-                        const actualIntervalDuration = (now - lastTwoSecondTimestamp) / 1000.0;
+                    powerCalculationTimer = setInterval(() => {
+                        if (!isTracking || stateHistory.length < 2) { // Need at least 2 states for a window
+                            updateUIDisplay({power:0}, {power:0, velocity:0}, {x:0,y:0,z:0}, 0, 0);
+                            return;
+                        }
 
-                        const displacementThisWindow = { ...imuPositionOffset };
-                        const finalVelocityThisWindow = { ...imuVelocity };
+                        const currentTime = performance.now();
+                        const targetPastTime = currentTime - POWER_CALC_WINDOW_MS;
 
-                        const {power, finalVelocityHorizontal} = calculateCyclingPower({ // Get both values
-                            displacement: displacementThisWindow,
-                            finalVelocity: finalVelocityThisWindow,
-                            deltaTimeWindow: actualIntervalDuration,
+                        let stateCurrent = stateHistory[stateHistory.length - 1];
+                        let statePast = null;
+
+                        for (let i = stateHistory.length - 1; i >= 0; i--) {
+                            if (stateHistory[i].ts <= targetPastTime) {
+                                statePast = stateHistory[i];
+                                break;
+                            }
+                        }
+                         // If no exact past state, use the oldest if history is shorter than window
+                        if (!statePast && stateHistory.length > 0) {
+                            statePast = stateHistory[0];
+                        }
+
+
+                        if (!stateCurrent || !statePast) {
+                            console.warn("Not enough state history for power calculation window.");
+                            updateUIDisplay({power:0}, {power:0, velocity:0}, {x:0,y:0,z:0}, 0, 0);
+                            return;
+                        }
+
+                        const deltaTimeWindow = (stateCurrent.ts - statePast.ts) / 1000.0;
+
+                        const displacement = {
+                            x: stateCurrent.pos.x - statePast.pos.x,
+                            y: stateCurrent.pos.y - statePast.pos.y,
+                            z: stateCurrent.pos.z - statePast.pos.z
+                        };
+
+                        const initialVelocityTotalMag = Math.sqrt(statePast.vel.x**2 + statePast.vel.y**2 + statePast.vel.z**2);
+                        const finalVelocityTotalMag = Math.sqrt(stateCurrent.vel.x**2 + stateCurrent.vel.y**2 + stateCurrent.vel.z**2);
+                        const initialVelocityHorizontal = Math.sqrt(statePast.vel.x**2 + statePast.vel.y**2);
+                        const finalVelocityHorizontalCurrentWindow = Math.sqrt(stateCurrent.vel.x**2 + stateCurrent.vel.y**2);
+
+
+                        const {power, finalVelocityHorizontal} = calculateCyclingPower({
+                            displacement: displacement,
+                            initialVelocityTotalMag: initialVelocityTotalMag,
+                            finalVelocityTotalMag: finalVelocityTotalMag,
+                            initialVelocityHorizontal: initialVelocityHorizontal,
+                            finalVelocityHorizontal: finalVelocityHorizontalCurrentWindow,
+                            deltaTimeWindow: deltaTimeWindow,
                             userConfig: userPowerParams
                         });
 
-                        // Update history
                         powerHistory.push(power);
-                        if (powerHistory.length > MAX_HISTORY_LENGTH) powerHistory.shift();
-                        velocityHistory.push(finalVelocityHorizontal);
-                        if (velocityHistory.length > MAX_HISTORY_LENGTH) velocityHistory.shift();
+                        if (powerHistory.length > MAX_MEDIAN_HISTORY_LENGTH) powerHistory.shift();
+                        velocityHistory.push(finalVelocityHorizontalCurrentWindow); // Use final H vel of current window
+                        if (velocityHistory.length > MAX_MEDIAN_HISTORY_LENGTH) velocityHistory.shift();
 
-                        // Calculate medians
-                        const medianPower = calculateMedian(powerHistory);
-                        const medianVelocity = calculateMedian(velocityHistory);
+                        const medianPower = calculateMedianOfTopN(powerHistory, MAX_MEDIAN_HISTORY_LENGTH, 5);
+                        const medianVelocity = calculateMedianOfTopN(velocityHistory, MAX_MEDIAN_HISTORY_LENGTH, 5);
 
-                        updateUIDisplayCycleEnd(displacementThisWindow, finalVelocityThisWindow, actualIntervalDuration, power, medianPower, medianVelocity);
+                        updateUIDisplay(
+                            {power: power},
+                            {power: medianPower, velocity: medianVelocity},
+                            displacement,
+                            finalVelocityHorizontalCurrentWindow,
+                            deltaTimeWindow
+                        );
 
-                        imuPositionOffset = { x: 0, y: 0, z: 0 };
-                        imuVelocity = { x: 0, y: 0, z: 0 };
-                        lastTwoSecondTimestamp = now;
+                    }, POWER_CALC_INTERVAL_MS); // Update power display every 1 second
 
-                    }, 2000);
                 } catch (error) {
                     statusEl.textContent = "Failed to start sensors: " + error.message;
                     console.error("Sensor start failed:", error);
-                     isTracking = false; // Ensure tracking flag is false if init fails
+                    isTracking = false;
                 }
             } else {
                 isTracking = false;
                 if (linearAccelerationSensor) linearAccelerationSensor.stop();
                 if (absoluteOrientationSensor) absoluteOrientationSensor.stop();
-                if (twoSecondIntervalTimer) clearInterval(twoSecondIntervalTimer);
-                twoSecondIntervalTimer = null;
+                if (powerCalculationTimer) clearInterval(powerCalculationTimer);
+                powerCalculationTimer = null;
 
                 statusEl.textContent = "Idle - Tracking Stopped";
-                powerOutputEl.textContent = "0";
-                medianPowerOutputEl.textContent = "0";
-                medianVelocityOutputEl.textContent = "0.00";
+                updateUIDisplay({power:0}, {power:0, velocity:0}, {x:0,y:0,z:0}, 0, 0);
                 startTrackingButton.textContent = "Start Tracking & Estimating Power";
                 startTrackingButton.classList.remove("stop");
                 permissionStatusEl.textContent = "";
                 lastTimestamp_IMU_Processing = null;
             }
         });
-        updateUIDisplayCycleEnd({x:0,y:0,z:0}, {x:0,y:0,z:0}, 0, 0, 0, 0);
+        updateUIDisplay({power:0}, {power:0, velocity:0}, {x:0,y:0,z:0}, 0, 0);
     </script>
 </body>
 </html>
