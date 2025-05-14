@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Cycling Power Estimator</title>
+    <style>
+        body { font-family: sans-serif; margin: 10px; background-color: #f0f0f0; color: #333; line-height: 1.6; }
+        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #0056b3; text-align: center; }
+        p { margin: 8px 0; }
+        strong { color: #007bff; }
+        .coordinates, .power-output { font-family: monospace; font-size: 1.1em; }
+        button { display: block; width: 100%; padding: 12px 15px; margin-top: 15px; background-color: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 1em; }
+        button:hover { background-color: #218838; }
+        button.stop { background-color: #dc3545; }
+        button.stop:hover { background-color: #c82333; }
+        #permissionStatus { font-style: italic; margin-bottom: 10px; text-align: center; }
+        .input-group { margin-bottom: 12px; }
+        .input-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .input-group input { width: calc(100% - 22px); padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        hr { border: 0; height: 1px; background: #ddd; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Cycling Power Estimator</h1>
+        <div id="permissionStatus">Requesting permissions...</div>
+
+        <h2>Configuration</h2>
+        <div class="input-group">
+            <label for="totalMass">Total Mass (rider+bike, kg):</label>
+            <input type="number" id="totalMass" value="80">
+        </div>
+        <div class="input-group">
+            <label for="dragCoefficient">Drag Coefficient (Cd):</label>
+            <input type="number" id="dragCoefficient" step="0.01" value="0.7">
+        </div>
+        <div class="input-group">
+            <label for="frontalArea">Frontal Area (A, m²):</label>
+            <input type="number" id="frontalArea" step="0.01" value="0.5">
+        </div>
+        <div class="input-group">
+            <label for="rollingResistance">Rolling Resistance Coeff (Crr):</label>
+            <input type="number" id="rollingResistance" step="0.001" value="0.005">
+        </div>
+         <div class="input-group">
+            <label for="airDensity">Air Density (kg/m³):</label>
+            <input type="number" id="airDensity" step="0.01" value="1.1"> </div>
+
+        <button id="startTrackingButton">Start Tracking & Estimating Power</button>
+
+        <hr>
+        <h2>Live Data</h2>
+        <p><strong>Status:</strong> <span id="status">Idle</span></p>
+        <p class="power-output"><strong>Estimated Power:</strong> <span id="powerOutput">0</span> W</p>
+        <p class="coordinates">Window Offset X: <span id="imuOffsetX">0.00</span>m, Y: <span id="imuOffsetY">0.00</span>m, Z: <span id="imuOffsetZ">0.00</span>m</p>
+        <p class="coordinates">Window Velocity X: <span id="imuVelX">0.00</span>m/s, Y: <span id="imuVelY">0.00</span>m/s, Z: <span id="imuVelZ">0.00</span>m/s</p>
+        <p>GPS (for initial reference): Lat: <span id="gpsLat">N/A</span>, Lon: <span id="gpsLon">N/A</span></p>
+    </div>
+
+    <script>
+        // --- UI Elements ---
+        const statusEl = document.getElementById('status');
+        const powerOutputEl = document.getElementById('powerOutput');
+        const gpsLatEl = document.getElementById('gpsLat');
+        const gpsLonEl = document.getElementById('gpsLon');
+        const imuOffsetXEl = document.getElementById('imuOffsetX');
+        const imuOffsetYEl = document.getElementById('imuOffsetY');
+        const imuOffsetZEl = document.getElementById('imuOffsetZ');
+        const imuVelXEl = document.getElementById('imuVelX');
+        const imuVelYEl = document.getElementById('imuVelY');
+        const imuVelZEl = document.getElementById('imuVelZ');
+        const startTrackingButton = document.getElementById('startTrackingButton');
+        const permissionStatusEl = document.getElementById('permissionStatus');
+        // User Parameter Inputs
+        const totalMassInput = document.getElementById('totalMass');
+        const dragCoefficientInput = document.getElementById('dragCoefficient');
+        const frontalAreaInput = document.getElementById('frontalArea');
+        const rollingResistanceInput = document.getElementById('rollingResistance');
+        const airDensityInput = document.getElementById('airDensity');
+
+
+        // --- State Variables ---
+        let linearAccelerationSensor = null;
+        let absoluteOrientationSensor = null;
+        let geoWatchId = null; // Only for initial fix, might not be needed continuously
+
+        let imuRawAcceleration = { x: 0, y: 0, z: 0 };
+        let imuOrientationQuaternion = [0, 0, 0, 1];
+        let imuWorldAcceleration = { x: 0, y: 0, z: 0 };
+        let imuVelocity = { x: 0, y: 0, z: 0 };         // Relative to start of 20s window
+        let imuPositionOffset = { x: 0, y: 0, z: 0 };   // Relative to start of 20s window
+
+        let lastTimestamp_IMU = null;
+        let isTracking = false;
+        const R_EARTH = 6378137;
+        const GRAVITY_ACCEL = 9.80665; // m/s^2
+
+        // Power Calculation State
+        let powerCalculationIntervalTimer = null;
+        let twentySecondResetTimer = null;
+        let lastPowerCalcState = {
+            position: { x: 0, y: 0, z: 0 },
+            velocityHorizontal: 0,
+            timestamp: 0
+        };
+        let userPowerParams = {};
+
+        // --- Helper Functions (rotateVectorByQuaternion as before) ---
+        function rotateVectorByQuaternion(vec, quat) {
+            const [qx, qy, qz, qw] = quat;
+            const { x, y, z } = vec;
+            const tx = 2 * (qy * z - qz * y);
+            const ty = 2 * (qz * x - qx * z);
+            const tz = 2 * (qx * y - qy * x);
+            const rotatedX = x + qw * tx + (qy * tz - qz * ty);
+            const rotatedY = y + qw * ty + (qz * tx - qx * tz);
+            const rotatedZ = z + qw * tz + (qx * ty - qy * tx);
+            return { x: rotatedX, y: rotatedY, z: rotatedZ };
+        }
+
+
+        // --- Sensor Handling & Core Logic ---
+        function processIMUData() {
+            if (!isTracking) return;
+
+            imuWorldAcceleration = rotateVectorByQuaternion(imuRawAcceleration, imuOrientationQuaternion);
+
+            if (lastTimestamp_IMU) {
+                const deltaTime = (performance.now() - lastTimestamp_IMU) / 1000;
+
+                imuVelocity.x += imuWorldAcceleration.x * deltaTime;
+                imuVelocity.y += imuWorldAcceleration.y * deltaTime;
+                imuVelocity.z += imuWorldAcceleration.z * deltaTime;
+
+                imuPositionOffset.x += imuVelocity.x * deltaTime;
+                imuPositionOffset.y += imuVelocity.y * deltaTime;
+                imuPositionOffset.z += imuVelocity.z * deltaTime;
+            }
+            lastTimestamp_IMU = performance.now();
+            updateUIDisplay(); // Update debug IMU display
+        }
+
+        function handleGPSData(position) { // Only for initial reference, not continuous recalibration
+            const { latitude, longitude } = position.coords;
+            gpsLatEl.textContent = latitude.toFixed(7);
+            gpsLonEl.textContent = longitude.toFixed(7);
+            statusEl.textContent = "GPS reference acquired. Tracking...";
+            // We don't need to clear this watchId if we only want one fix.
+            // Or, clear it after first good fix if enableHighAccuracy is true and we want to save battery.
+            if (geoWatchId && latitude !== 0 && longitude !== 0) { // Stop after first good fix
+                 navigator.geolocation.clearWatch(geoWatchId);
+                 geoWatchId = null;
+            }
+        }
+
+        function handleGPSError(error) {
+            statusEl.textContent = `GPS Error: ${error.message}. Using default orientation.`;
+            console.warn("GPS Error: ", error);
+             if (geoWatchId) { // Stop trying if error
+                 navigator.geolocation.clearWatch(geoWatchId);
+                 geoWatchId = null;
+            }
+        }
+
+        // --- Power Calculation ---
+        function calculateCyclingPower(params) {
+            const {
+                currentPosition, currentVelocity,
+                lastPosition, lastVelocityHorizontal,
+                deltaTime, userConfig
+            } = params;
+
+            if (deltaTime <= 0) return 0;
+
+            const dx = currentPosition.x - lastPosition.x;
+            const dy = currentPosition.y - lastPosition.y;
+            const dz = currentPosition.z - lastPosition.z;
+
+            const distanceHorizontal = Math.sqrt(dx * dx + dy * dy);
+            const currentVelocityHorizontal = Math.sqrt(currentVelocity.x * currentVelocity.x + currentVelocity.y * currentVelocity.y);
+
+            // 1. Work against gravity
+            const workGravity = userConfig.totalMass * GRAVITY_ACCEL * dz;
+
+            // 2. Work against aerodynamic drag
+            // Use average horizontal velocity for the interval
+            const avgVelocityHorizontal = (currentVelocityHorizontal + lastVelocityHorizontal) / 2;
+            const forceDrag = 0.5 * userConfig.airDensity * avgVelocityHorizontal * avgVelocityHorizontal * userConfig.dragCoefficient * userConfig.frontalArea;
+            const workDrag = forceDrag * distanceHorizontal;
+
+            // 3. Work against rolling resistance
+            // Assuming cos(slope_angle) is approx 1 for simplicity
+            const forceRolling = userConfig.rollingResistanceCoefficient * userConfig.totalMass * GRAVITY_ACCEL;
+            const workRolling = forceRolling * distanceHorizontal;
+
+            // 4. Work for Kinetic Energy Change (using horizontal velocity component)
+            const workKinetic = 0.5 * userConfig.totalMass * (currentVelocityHorizontal * currentVelocityHorizontal - lastVelocityHorizontal * lastVelocityHorizontal);
+
+            const totalWork = workGravity + workDrag + workRolling + workKinetic;
+            let power = totalWork / deltaTime;
+
+            return power > 0 ? power : 0; // Often, propulsive power is considered non-negative
+        }
+
+
+        // --- UI Update ---
+        function updateUIDisplay() {
+            imuOffsetXEl.textContent = imuPositionOffset.x.toFixed(2);
+            imuOffsetYEl.textContent = imuPositionOffset.y.toFixed(2);
+            imuOffsetZEl.textContent = imuPositionOffset.z.toFixed(2);
+            imuVelXEl.textContent = imuVelocity.x.toFixed(2);
+            imuVelYEl.textContent = imuVelocity.y.toFixed(2);
+            imuVelZEl.textContent = imuVelocity.z.toFixed(2);
+        }
+
+        // --- Permissions and Initialization ---
+        async function requestPermissionsAndInitSensors() {
+            permissionStatusEl.textContent = "Requesting permissions...";
+            try {
+                if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+                    const motionPerm = await DeviceMotionEvent.requestPermission();
+                    if (motionPerm !== 'granted') throw new Error('Motion sensor permission denied.');
+                }
+                if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    const orientationPerm = await DeviceOrientationEvent.requestPermission();
+                    if (orientationPerm !== 'granted') throw new Error('Orientation sensor permission denied.');
+                }
+
+                permissionStatusEl.textContent = "Permissions granted. Initializing sensors...";
+
+                return new Promise((resolve, reject) => {
+                    let sensorsInitialized = 0;
+                    const SENSORS_TO_INIT = 2; // LinearAccel + AbsoluteOrientation
+
+                    const onSensorInit = () => {
+                        sensorsInitialized++;
+                        if (sensorsInitialized >= SENSORS_TO_INIT) resolve(true);
+                    };
+                    const onSensorError = (sensorName, event) => {
+                         console.error(`${sensorName} Error:`, event.error);
+                         statusEl.textContent = `${sensorName} Error: ${event.error.message}. Tracking may be inaccurate.`;
+                         // Potentially resolve(false) or allow graceful degradation if some sensors fail
+                         // For now, we'll let it try to continue if one sensor fails but warn the user.
+                         onSensorInit(); // Count it as "processed" to not hang the promise
+                    };
+
+                    if ('LinearAccelerationSensor' in window) {
+                        linearAccelerationSensor = new LinearAccelerationSensor({ frequency: 60 });
+                        linearAccelerationSensor.addEventListener('reading', () => {
+                            imuRawAcceleration.x = linearAccelerationSensor.x || 0;
+                            imuRawAcceleration.y = linearAccelerationSensor.y || 0;
+                            imuRawAcceleration.z = linearAccelerationSensor.z || 0;
+                            if (isTracking) processIMUData();
+                        });
+                        linearAccelerationSensor.addEventListener('error', e => onSensorError('LinearAccelerationSensor', e));
+                        linearAccelerationSensor.start();
+                        onSensorInit();
+                    } else { reject(new Error('LinearAccelerationSensor not supported.')); return; }
+
+                    if ('AbsoluteOrientationSensor' in window) {
+                        absoluteOrientationSensor = new AbsoluteOrientationSensor({ frequency: 60 });
+                        absoluteOrientationSensor.addEventListener('reading', () => {
+                            if (absoluteOrientationSensor.quaternion) {
+                                imuOrientationQuaternion = [...absoluteOrientationSensor.quaternion];
+                            }
+                        });
+                        absoluteOrientationSensor.addEventListener('error', e => onSensorError('AbsoluteOrientationSensor', e));
+                        absoluteOrientationSensor.start();
+                        onSensorInit();
+                    } else { reject(new Error('AbsoluteOrientationSensor not supported.')); return; }
+
+                    // Initialize Geolocation for a reference point (optional but good for context)
+                    if ('geolocation' in navigator) {
+                        geoWatchId = navigator.geolocation.watchPosition(handleGPSData, handleGPSError,
+                            { enableHighAccuracy: true, maximumAge: 60000, timeout: 10000 });
+                    } else {
+                        console.warn("Geolocation not supported.");
+                    }
+                });
+
+            } catch (error) {
+                permissionStatusEl.textContent = `Error: ${error.message}`;
+                statusEl.textContent = "Error: Permissions or sensors unavailable.";
+                console.error("Permission or sensor init error:", error);
+                return false;
+            }
+        }
+
+
+        // --- Main Loop Control ---
+        startTrackingButton.addEventListener('click', async () => {
+            if (!isTracking) {
+                // Get user parameters
+                userPowerParams = {
+                    totalMass: parseFloat(totalMassInput.value),
+                    dragCoefficient: parseFloat(dragCoefficientInput.value),
+                    frontalArea: parseFloat(frontalAreaInput.value),
+                    rollingResistanceCoefficient: parseFloat(rollingResistanceInput.value),
+                    airDensity: parseFloat(airDensityInput.value)
+                };
+                if (Object.values(userPowerParams).some(isNaN)) {
+                    alert("Please ensure all configuration values are valid numbers.");
+                    return;
+                }
+
+                const success = await requestPermissionsAndInitSensors();
+                if (success) {
+                    isTracking = true;
+                    startTrackingButton.textContent = "Stop Tracking";
+                    startTrackingButton.classList.add("stop");
+                    statusEl.textContent = "Waiting for sensor stabilization...";
+
+                    // Reset states for new session
+                    imuPositionOffset = { x: 0, y: 0, z: 0 };
+                    imuVelocity = { x: 0, y: 0, z: 0 };
+                    lastTimestamp_IMU = performance.now();
+                    lastPowerCalcState = {
+                        position: { ...imuPositionOffset },
+                        velocityHorizontal: 0,
+                        timestamp: performance.now()
+                    };
+
+
+                    // Start 20-second reset timer
+                    twentySecondResetTimer = setInterval(() => {
+                        if (!isTracking) return;
+                        console.log("20s Window Reset: Resetting IMU offset and velocity.");
+                        imuPositionOffset = { x: 0, y: 0, z: 0 };
+                        imuVelocity = { x: 0, y: 0, z: 0 };
+                        // Reset base for next power calc within the new window
+                        lastPowerCalcState.position = { ...imuPositionOffset };
+                        lastPowerCalcState.velocityHorizontal = 0; // velocity within window also resets
+                        lastPowerCalcState.timestamp = performance.now(); // Avoid large dT on first calc after reset
+                    }, 20000);
+
+                    // Start power calculation interval timer (e.g., every 2 seconds)
+                    powerCalculationIntervalTimer = setInterval(() => {
+                        if (!isTracking) return;
+
+                        const now = performance.now();
+                        const intervalDeltaTime = (now - lastPowerCalcState.timestamp) / 1000;
+
+                        if (intervalDeltaTime < 0.5) return; // Avoid overly frequent calculations
+
+                        const power = calculateCyclingPower({
+                            currentPosition: imuPositionOffset,
+                            currentVelocity: imuVelocity,
+                            lastPosition: lastPowerCalcState.position,
+                            lastVelocityHorizontal: lastPowerCalcState.velocityHorizontal,
+                            deltaTime: intervalDeltaTime,
+                            userConfig: userPowerParams
+                        });
+
+                        powerOutputEl.textContent = power.toFixed(0);
+
+                        // Store current state for next calculation
+                        lastPowerCalcState.position = { ...imuPositionOffset };
+                        lastPowerCalcState.velocityHorizontal = Math.sqrt(imuVelocity.x**2 + imuVelocity.y**2);
+                        lastPowerCalcState.timestamp = now;
+
+                    }, 2000); // Calculate power every 2 seconds
+
+                } else {
+                     statusEl.textContent = "Failed to start sensors.";
+                }
+            } else {
+                isTracking = false;
+                if (linearAccelerationSensor) linearAccelerationSensor.stop();
+                if (absoluteOrientationSensor) absoluteOrientationSensor.stop();
+                if (geoWatchId !== null) {
+                    navigator.geolocation.clearWatch(geoWatchId);
+                    geoWatchId = null;
+                }
+                if (twentySecondResetTimer) clearInterval(twentySecondResetTimer);
+                if (powerCalculationIntervalTimer) clearInterval(powerCalculationIntervalTimer);
+
+                statusEl.textContent = "Idle - Tracking Stopped";
+                powerOutputEl.textContent = "0";
+                startTrackingButton.textContent = "Start Tracking & Estimating Power";
+                startTrackingButton.classList.remove("stop");
+                permissionStatusEl.textContent = "";
+            }
+        });
+        // Initial UI state
+        updateUIDisplay();
+    </script>
+</body>
+</html>
