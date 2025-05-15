@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Cycling Power Estimator (1s, Medians, Session Avg)</title>
+    <title>Cycling Power Estimator (2s, Max, Session Avg)</title>
     <style>
         /* CSS remains largely the same */
         body { font-family: sans-serif; margin: 10px; background-color: #f0f0f0; color: #333; line-height: 1.6; }
@@ -11,7 +11,7 @@
         h1, h2 { color: #0056b3; text-align: center; }
         p { margin: 8px 0; }
         strong { color: #007bff; }
-        .coordinates, .power-output, .median-output, .session-summary-output { font-family: monospace; font-size: 1.1em; }
+        .coordinates, .power-output, .max-output, .session-summary-output { font-family: monospace; font-size: 1.1em; } /* Added max-output */
         button { display: block; width: 100%; padding: 12px 15px; margin-top: 15px; background-color: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 1em; }
         button:hover { background-color: #218838; }
         button.stop { background-color: #dc3545; }
@@ -26,7 +26,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>Cycling Power Estimator (1s, Medians, Session Avg)</h1>
+        <h1>Cycling Power Estimator (2s, Max, Session Avg)</h1>
         <div id="permissionStatus">Requesting permissions...</div>
 
         <h2>Configuration</h2>
@@ -58,22 +58,21 @@
         <button id="startTrackingButton">Start Tracking & Estimating Power</button>
 
         <hr>
-        <h2>Live Data (per 1-second window)</h2>
+        <h2>Live Data (per 2-second window)</h2>
         <p><strong>Status:</strong> <span id="status">Idle</span></p>
         <p class="power-output"><strong>Estimated Power:</strong> <span id="powerOutput">0</span> W</p>
         <p class="coordinates">Win. Disp. X: <span id="imuDispX">0.00</span>m, Y: <span id="imuDispY">0.00</span>m, Z: <span id="imuDispZ">0.00</span>m</p>
         <p class="coordinates">Win. Final Vel. (H): <span id="winFinalVelH">0.00</span> m/s (<span id="winFinalVelHKmh">0.0</span> km/h)</p>
         <p>Window Duration: <span id="windowDuration">0.00</span>s</p>
         <hr>
-        <h2>Medians (Top 5 of last 10 samples)</h2>
-        <p class="median-output"><strong>Median Power:</strong> <span id="medianPowerOutput">0</span> W</p>
-        <p class="median-output"><strong>Median Velocity (H):</strong> <span id="medianVelocityOutput">0.00</span> m/s (<span id="medianVelocityOutputKmh">0.0</span> km/h)</p>
+        <h2>Maximums (last 5 samples)</h2> <p class="max-output"><strong>Max Power:</strong> <span id="maxPowerOutput">0</span> W</p>
+        <p class="max-output"><strong>Max Velocity (H):</strong> <span id="maxVelocityOutput">0.00</span> m/s (<span id="maxVelocityOutputKmh">0.0</span> km/h)</p>
 
         <div id="sessionSummary" style="display: none;">
             <hr>
             <h2>Session Summary</h2>
-            <p class="session-summary-output"><strong>Avg. of Median Power:</strong> <span id="avgMedianPower">0</span> W</p>
-            <p class="session-summary-output"><strong>Avg. of Median Velocity (H):</strong> <span id="avgMedianVelocity">0.00</span> m/s (<span id="avgMedianVelocityKmh">0.0</span> km/h)</p>
+            <p class="session-summary-output"><strong>Session Avg. Power:</strong> <span id="avgSessionPower">0</span> W</p>
+            <p class="session-summary-output"><strong>Session Avg. Velocity (H):</strong> <span id="avgSessionVelocity">0.00</span> m/s (<span id="avgSessionVelocityKmh">0.0</span> km/h)</p>
         </div>
     </div>
 
@@ -87,13 +86,13 @@
         const winFinalVelHEl = document.getElementById('winFinalVelH');
         const winFinalVelHKmhEl = document.getElementById('winFinalVelHKmh');
         const windowDurationEl = document.getElementById('windowDuration');
-        const medianPowerOutputEl = document.getElementById('medianPowerOutput');
-        const medianVelocityOutputEl = document.getElementById('medianVelocityOutput');
-        const medianVelocityOutputKmhEl = document.getElementById('medianVelocityOutputKmh');
+        const maxPowerOutputEl = document.getElementById('maxPowerOutput'); // Renamed from medianPowerOutputEl
+        const maxVelocityOutputEl = document.getElementById('maxVelocityOutput'); // Renamed from medianVelocityOutputEl
+        const maxVelocityOutputKmhEl = document.getElementById('maxVelocityOutputKmh'); // Renamed
         const sessionSummaryEl = document.getElementById('sessionSummary');
-        const avgMedianPowerEl = document.getElementById('avgMedianPower');
-        const avgMedianVelocityEl = document.getElementById('avgMedianVelocity');
-        const avgMedianVelocityKmhEl = document.getElementById('avgMedianVelocityKmh');
+        const avgSessionPowerEl = document.getElementById('avgSessionPower'); // Renamed from avgMedianPowerEl
+        const avgSessionVelocityEl = document.getElementById('avgSessionVelocity'); // Renamed
+        const avgSessionVelocityKmhEl = document.getElementById('avgSessionVelocityKmh'); // Renamed
         const startTrackingButton = document.getElementById('startTrackingButton');
         const permissionStatusEl = document.getElementById('permissionStatus');
 
@@ -120,18 +119,18 @@
         const GRAVITY_ACCEL = 9.80665;
         let ACCEL_FILTER_ALPHA = 0.2;
 
-        let oneSecondCycleTimer = null; // Renamed from twoSecondCycleTimer
-        let lastOneSecondCycleTimestamp = 0; // Renamed
+        let twoSecondCycleTimer = null; // Renamed back
+        let lastTwoSecondCycleTimestamp = 0; // Renamed back
         let userPowerParams = {};
 
-        // History for median calculation
-        let powerWindowHistory = []; // Stores raw power values from each 1s window
-        let velocityWindowHistory = []; // Stores final horizontal velocity (m/s) from each 1s window
-        const MAX_WINDOW_HISTORY_LENGTH = 3;
+        // History for Max calculation
+        let powerWindowHistory = [];
+        let velocityWindowHistory = [];
+        const MAX_WINDOW_HISTORY_LENGTH = 5; // Changed to 5
 
-        // History for session averages of medians
-        let sessionMedianPowerSamples = [];
-        let sessionMedianVelocitySamples = []; // Stores median velocity in m/s
+        // History for session averages of all window values
+        let sessionOverallPowerSamples = [];
+        let sessionOverallVelocitySamples = [];
 
 
         function mpsToKmh(mps) {
@@ -139,6 +138,7 @@
         }
 
         function rotateVectorByQuaternion(vec, quat) {
+            // ... (same as before)
             const [qx, qy, qz, qw] = quat;
             const { x, y, z } = vec;
             const tx = 2 * (qy * z - qz * y);
@@ -151,9 +151,10 @@
         }
 
         function processIMUData() {
+            // ... (same as before)
             if (!isTracking || lastTimestamp_IMU_Processing === null) return;
             const now = performance.now();
-            const deltaTimeIMU = (now - lastTimestamp_IMU_Processing) / 5000.0;
+            const deltaTimeIMU = (now - lastTimestamp_IMU_Processing) / 1000.0;
             lastTimestamp_IMU_Processing = now;
 
             if (deltaTimeIMU <= 0 || deltaTimeIMU > 0.5) {
@@ -178,8 +179,9 @@
         }
 
         function calculateCyclingPower(params) {
+            // ... (same as before)
             const { displacement, finalVelocity, deltaTimeWindow, userConfig } = params;
-            if (deltaTimeWindow < 0.05) { // Adjusted guard for 1s window
+            if (deltaTimeWindow < 0.1) {
                 return {power: 0, finalVelocityHorizontal: 0};
             }
             const dx = displacement.x; const dy = displacement.y; const dz = displacement.z;
@@ -199,28 +201,9 @@
             return {power: power > 0 ? power : 0, finalVelocityHorizontal: finalVelocityHorizontal};
         }
 
-        function calculateMedian(arr) {
+        function calculateMaximum(arr) {
             if (!arr || arr.length === 0) return 0;
-            const sortedArr = [...arr].sort((a, b) => a - b);
-            const mid = Math.floor(sortedArr.length / 2);
-            if (sortedArr.length % 2 === 0) {
-                if (sortedArr.length < 2) return sortedArr[0] || 0;
-                return (sortedArr[mid - 1] + sortedArr[mid]) / 2;
-            } else {
-                return sortedArr[mid];
-            }
-        }
-
-        function calculateMedianOfTopN(arr, totalSamplesToConsider, topN) {
-            if (!arr || arr.length === 0) return 0;
-            const consideredSamples = arr.length > totalSamplesToConsider ? arr.slice(-totalSamplesToConsider) : [...arr];
-            if (consideredSamples.length === 0) return 0; // handle empty after slice
-            if (consideredSamples.length < topN) {
-                return calculateMedian(consideredSamples);
-            }
-            const sortedArrDesc = [...consideredSamples].sort((a, b) => b - a);
-            const topNValues = sortedArrDesc.slice(0, topN);
-            return calculateMedian(topNValues);
+            return Math.max(...arr);
         }
 
         function calculateAverage(arr) {
@@ -229,7 +212,7 @@
             return sum / arr.length;
         }
 
-        function updateUIDisplayCycleEnd(displacement, finalVelocity, duration, currentPowerData, medianPower, medianVelocityMps) {
+        function updateUIDisplayCycleEnd(displacement, finalVelocity, duration, currentPowerData, maxPower, maxVelocityMps) {
             imuDispXEl.textContent = displacement.x.toFixed(2);
             imuDispYEl.textContent = displacement.y.toFixed(2);
             imuDispZEl.textContent = displacement.z.toFixed(2);
@@ -240,9 +223,9 @@
             winFinalVelHKmhEl.textContent = mpsToKmh(currentPowerData.finalVelocityHorizontal).toFixed(1);
             windowDurationEl.textContent = duration.toFixed(2);
             powerOutputEl.textContent = currentPowerData.power.toFixed(0);
-            medianPowerOutputEl.textContent = medianPower.toFixed(0);
-            medianVelocityOutputEl.textContent = medianVelocityMps.toFixed(2);
-            medianVelocityOutputKmhEl.textContent = mpsToKmh(medianVelocityMps).toFixed(1);
+            maxPowerOutputEl.textContent = maxPower.toFixed(0); // Changed from median
+            maxVelocityOutputEl.textContent = maxVelocityMps.toFixed(2); // Changed from median
+            maxVelocityOutputKmhEl.textContent = mpsToKmh(maxVelocityMps).toFixed(1); // Changed
         }
 
         async function requestPermissionsAndInitSensors() {
@@ -323,23 +306,23 @@
                     startTrackingButton.textContent = "Stop Tracking";
                     startTrackingButton.classList.add("stop");
                     statusEl.textContent = "Tracking...";
-                    sessionSummaryEl.style.display = 'none'; // Hide summary
+                    sessionSummaryEl.style.display = 'none';
 
                     imuPositionOffset_window = { x: 0, y: 0, z: 0 };
                     imuVelocity_window = { x: 0, y: 0, z: 0 };
                     filteredWorldAcceleration = { x: 0, y: 0, z: 0 };
-                    powerWindowHistory = [];
-                    velocityWindowHistory = [];
-                    sessionMedianPowerSamples = [];
-                    sessionMedianVelocitySamples = [];
+                    powerWindowHistory = []; // For max of last 5
+                    velocityWindowHistory = []; // For max of last 5
+                    sessionOverallPowerSamples = []; // For session average
+                    sessionOverallVelocitySamples = []; // For session average
                     lastTimestamp_IMU_Processing = performance.now();
-                    lastOneSecondCycleTimestamp = performance.now();
+                    lastTwoSecondCycleTimestamp = performance.now(); // Renamed back
 
-                    oneSecondCycleTimer = setInterval(() => {
+                    twoSecondCycleTimer = setInterval(() => { // Renamed back, interval 2000ms
                         if (!isTracking) return;
 
                         const now = performance.now();
-                        const actualIntervalDuration = (now - lastOneSecondCycleTimestamp) / 5000.0;
+                        const actualIntervalDuration = (now - lastTwoSecondCycleTimestamp) / 1000.0;
 
                         const displacementCurrentWindow = { ...imuPositionOffset_window };
                         const finalVelocityCurrentWindow = { ...imuVelocity_window };
@@ -351,24 +334,27 @@
                             userConfig: userPowerParams
                         });
 
+                        // Update history for Max of last 5
                         powerWindowHistory.push(powerData.power);
                         if (powerWindowHistory.length > MAX_WINDOW_HISTORY_LENGTH) powerWindowHistory.shift();
                         velocityWindowHistory.push(powerData.finalVelocityHorizontal);
                         if (velocityWindowHistory.length > MAX_WINDOW_HISTORY_LENGTH) velocityWindowHistory.shift();
 
-                        const currentMedianPower = calculateMedianOfTopN(powerWindowHistory, MAX_WINDOW_HISTORY_LENGTH, 3);
-                        const currentMedianVelocityMps = calculateMedianOfTopN(velocityWindowHistory, MAX_WINDOW_HISTORY_LENGTH, 3);
+                        // Store all window values for session average
+                        sessionOverallPowerSamples.push(powerData.power);
+                        sessionOverallVelocitySamples.push(powerData.finalVelocityHorizontal);
 
-                        sessionMedianPowerSamples.push(currentMedianPower);
-                        sessionMedianVelocitySamples.push(currentMedianVelocityMps);
+                        // Calculate Max of last 5
+                        const maxPowerLast5 = calculateMaximum(powerWindowHistory);
+                        const maxVelocityMpsLast5 = calculateMaximum(velocityWindowHistory);
 
-                        updateUIDisplayCycleEnd(displacementCurrentWindow, finalVelocityCurrentWindow, actualIntervalDuration, powerData, currentMedianPower, currentMedianVelocityMps);
+                        updateUIDisplayCycleEnd(displacementCurrentWindow, finalVelocityCurrentWindow, actualIntervalDuration, powerData, maxPowerLast5, maxVelocityMpsLast5);
 
                         imuPositionOffset_window = { x: 0, y: 0, z: 0 };
                         imuVelocity_window = { x: 0, y: 0, z: 0 };
-                        lastOneSecondCycleTimestamp = now;
+                        lastTwoSecondCycleTimestamp = now;
 
-                    }, 5000); // Target 5-second interval
+                    }, 2000); // Interval back to 2000ms
 
                 } catch (error) {
                     statusEl.textContent = "Failed to start sensors: " + error.message;
@@ -379,8 +365,8 @@
                 isTracking = false;
                 if (linearAccelerationSensor) linearAccelerationSensor.stop();
                 if (absoluteOrientationSensor) absoluteOrientationSensor.stop();
-                if (oneSecondCycleTimer) clearInterval(oneSecondCycleTimer);
-                oneSecondCycleTimer = null;
+                if (twoSecondCycleTimer) clearInterval(twoSecondCycleTimer);
+                twoSecondCycleTimer = null;
 
                 statusEl.textContent = "Idle - Tracking Stopped";
                 startTrackingButton.textContent = "Start Tracking & Estimating Power";
@@ -388,20 +374,18 @@
                 permissionStatusEl.textContent = "";
                 lastTimestamp_IMU_Processing = null;
 
-                // Calculate and display session averages
-                const avgSessionPower = calculateAverage(sessionMedianPowerSamples);
-                const avgSessionVelocityMps = calculateAverage(sessionMedianVelocitySamples);
+                // Calculate and display session averages from ALL window samples
+                const avgSessionPower = calculateAverage(sessionOverallPowerSamples);
+                const avgSessionVelocityMps = calculateAverage(sessionOverallVelocitySamples);
 
-                avgMedianPowerEl.textContent = avgSessionPower.toFixed(0);
-                avgMedianVelocityEl.textContent = avgSessionVelocityMps.toFixed(2);
-                avgMedianVelocityKmhEl.textContent = mpsToKmh(avgSessionVelocityMps).toFixed(1);
-                sessionSummaryEl.style.display = 'block'; // Show summary
+                avgSessionPowerEl.textContent = avgSessionPower.toFixed(0);
+                avgSessionVelocityEl.textContent = avgSessionVelocityMps.toFixed(2);
+                avgSessionVelocityKmhEl.textContent = mpsToKmh(avgSessionVelocityMps).toFixed(1);
+                sessionSummaryEl.style.display = 'block';
 
-                // Optionally clear instantaneous displays or leave them with last values
-                 updateUIDisplayCycleEnd({x:0,y:0,z:0}, {x:0,y:0,z:0}, 0, {power:0, finalVelocityHorizontal:0}, 0, 0);
+                updateUIDisplayCycleEnd({x:0,y:0,z:0}, {x:0,y:0,z:0}, 0, {power:0, finalVelocityHorizontal:0}, 0, 0);
             }
         });
-        // Initial UI state
         updateUIDisplayCycleEnd({x:0,y:0,z:0}, {x:0,y:0,z:0}, 0, {power:0, finalVelocityHorizontal:0}, 0, 0);
     </script>
 </body>
