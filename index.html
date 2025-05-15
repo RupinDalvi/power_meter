@@ -127,7 +127,7 @@
         // History for median calculation
         let powerWindowHistory = []; // Stores raw power values from each 1s window
         let velocityWindowHistory = []; // Stores final horizontal velocity (m/s) from each 1s window
-        const MAX_WINDOW_HISTORY_LENGTH = 10;
+        const MAX_WINDOW_HISTORY_LENGTH = 3;
 
         // History for session averages of medians
         let sessionMedianPowerSamples = [];
@@ -153,7 +153,7 @@
         function processIMUData() {
             if (!isTracking || lastTimestamp_IMU_Processing === null) return;
             const now = performance.now();
-            const deltaTimeIMU = (now - lastTimestamp_IMU_Processing) / 1000.0;
+            const deltaTimeIMU = (now - lastTimestamp_IMU_Processing) / 5000.0;
             lastTimestamp_IMU_Processing = now;
 
             if (deltaTimeIMU <= 0 || deltaTimeIMU > 0.5) {
@@ -339,7 +339,7 @@
                         if (!isTracking) return;
 
                         const now = performance.now();
-                        const actualIntervalDuration = (now - lastOneSecondCycleTimestamp) / 1000.0;
+                        const actualIntervalDuration = (now - lastOneSecondCycleTimestamp) / 5000.0;
 
                         const displacementCurrentWindow = { ...imuPositionOffset_window };
                         const finalVelocityCurrentWindow = { ...imuVelocity_window };
@@ -356,8 +356,8 @@
                         velocityWindowHistory.push(powerData.finalVelocityHorizontal);
                         if (velocityWindowHistory.length > MAX_WINDOW_HISTORY_LENGTH) velocityWindowHistory.shift();
 
-                        const currentMedianPower = calculateMedianOfTopN(powerWindowHistory, MAX_WINDOW_HISTORY_LENGTH, 5);
-                        const currentMedianVelocityMps = calculateMedianOfTopN(velocityWindowHistory, MAX_WINDOW_HISTORY_LENGTH, 5);
+                        const currentMedianPower = calculateMedianOfTopN(powerWindowHistory, MAX_WINDOW_HISTORY_LENGTH, 3);
+                        const currentMedianVelocityMps = calculateMedianOfTopN(velocityWindowHistory, MAX_WINDOW_HISTORY_LENGTH, 3);
 
                         sessionMedianPowerSamples.push(currentMedianPower);
                         sessionMedianVelocitySamples.push(currentMedianVelocityMps);
@@ -368,7 +368,7 @@
                         imuVelocity_window = { x: 0, y: 0, z: 0 };
                         lastOneSecondCycleTimestamp = now;
 
-                    }, 1000); // Target 1-second interval
+                    }, 5000); // Target 5-second interval
 
                 } catch (error) {
                     statusEl.textContent = "Failed to start sensors: " + error.message;
